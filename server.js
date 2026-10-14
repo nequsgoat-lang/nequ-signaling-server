@@ -4,14 +4,22 @@
  * NIE przesyła wideo/audio — tylko metadane połączenia WebRTC.
  *
  * Uruchomienie: node server.js
- * Port: 8765 (lub PORT env)
+ * Railway: PORT env jest ustawiany automatycznie
  */
 
+const http      = require('http')
 const WebSocket = require('ws')
 const crypto    = require('crypto')
 
-const PORT     = process.env.PORT || 8765
-const wss      = new WebSocket.Server({ port: PORT, host: '0.0.0.0' })
+const PORT = process.env.PORT || 8765
+
+// HTTP server — Railway health check + upgrade do WebSocket
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' })
+  res.end('NEQU Signaling Server OK\n')
+})
+
+const wss = new WebSocket.Server({ server })
 
 // Mapa aktywnych sesji: sessionCode -> { host, viewer, permissions, createdAt, hostId }
 const sessions = new Map()
@@ -25,7 +33,7 @@ function log(...args) {
   console.log(`[${new Date().toISOString()}]`, ...args)
 }
 
-/** Generuj 6-cyfrowy kod sesji (format: NNN NNN) */
+/** Generuj 6-cyfrowy kod sesji */
 function genCode() {
   let code
   do {
@@ -47,7 +55,7 @@ function cleanupSessions() {
   for (const [code, sess] of sessions) {
     if (now - sess.createdAt > SESSION_TTL_MS) {
       log(`[CLEANUP] Sesja ${code} wygasła`)
-      if (sess.host) send(sess.host, { type: 'session-expired', code })
+      if (sess.host)   send(sess.host,   { type: 'session-expired', code })
       if (sess.viewer) send(sess.viewer, { type: 'session-expired', code })
       sessions.delete(code)
     }
@@ -69,31 +77,26 @@ wss.on('connection', (ws, req) => {
 
     switch (msg.type) {
 
-      // ── HOST tworzy nową sesję ────────────────────────────────────────
       case 'create-session': {
         const code = genCode()
-        const session = {
+        sessions.set(code, {
           host:        ws,
           viewer:      null,
           permissions: msg.permissions || { view: true, control: false, clipboard: false, audio: false },
           createdAt:   Date.now(),
           hostId:      peer.peerId,
           hostName:    msg.hostName || 'Host',
-        }
-        sessions.set(code, session)
+        })
         peer.role        = 'host'
         peer.sessionCode = code
-
         send(ws, { type: 'session-created', code, expiresIn: SESSION_TTL_MS })
         log(`[SESSION] Utworzono ${code} przez ${ip}`)
         break
       }
 
-      // ── VIEWER dołącza do sesji ───────────────────────────────────────
       case 'join-session': {
         const { code, viewerName } = msg
         const session = sessions.get(code)
-
         if (!session) {
           send(ws, { type: 'error', reason: 'invalid-code', message: 'Nieprawidłowy kod sesji lub sesja wygasła.' })
           return
@@ -102,35 +105,18 @@ wss.on('connection', (ws, req) => {
           send(ws, { type: 'error', reason: 'session-full', message: 'Sesja jest już zajęta.' })
           return
         }
-
         session.viewer   = ws
         peer.role        = 'viewer'
         peer.sessionCode = code
-
-        // Powiadom viewera o sukcesie + uprawnieniach
-        send(ws, {
-          type:        'session-joined',
-          code,
-          permissions: session.permissions,
-          hostName:    session.hostName,
-        })
-
-        // Powiadom hosta że viewer chce się połączyć (host musi zaakceptować)
-        send(session.host, {
-          type:       'viewer-waiting',
-          viewerName: viewerName || 'Widz',
-          viewerId:   peer.peerId,
-        })
-
+        send(ws, { type: 'session-joined', code, permissions: session.permissions, hostName: session.hostName })
+        send(session.host, { type: 'viewer-waiting', viewerName: viewerName || 'Widz', viewerId: peer.peerId })
         log(`[JOIN] ${viewerName || 'Widz'} dołącza do sesji ${code}`)
         break
       }
 
-      // ── HOST akceptuje lub odrzuca viewera ───────────────────────────
       case 'accept-viewer': {
         const session = sessions.get(peer.sessionCode)
         if (!session || peer.role !== 'host') return
-
         if (msg.accepted) {
           send(session.viewer, { type: 'accepted', permissions: session.permissions })
           log(`[ACCEPT] Host zaakceptował viewera w sesji ${peer.sessionCode}`)
@@ -142,7 +128,6 @@ wss.on('connection', (ws, req) => {
         break
       }
 
-      // ── WebRTC: SDP offer (host → viewer) ────────────────────────────
       case 'offer': {
         const session = sessions.get(peer.sessionCode)
         if (!session || peer.role !== 'host' || !session.viewer) return
@@ -150,7 +135,6 @@ wss.on('connection', (ws, req) => {
         break
       }
 
-      // ── WebRTC: SDP answer (viewer → host) ───────────────────────────
       case 'answer': {
         const session = sessions.get(peer.sessionCode)
         if (!session || peer.role !== 'viewer' || !session.host) return
@@ -158,7 +142,6 @@ wss.on('connection', (ws, req) => {
         break
       }
 
-      // ── WebRTC: ICE candidate (obie strony) ──────────────────────────
       case 'ice-candidate': {
         const session = sessions.get(peer.sessionCode)
         if (!session) return
@@ -167,22 +150,18 @@ wss.on('connection', (ws, req) => {
         break
       }
 
-      // ── HOST aktualizuje uprawnienia w trakcie sesji ─────────────────
       case 'update-permissions': {
         const session = sessions.get(peer.sessionCode)
         if (!session || peer.role !== 'host') return
         session.permissions = { ...session.permissions, ...msg.permissions }
         send(session.viewer, { type: 'permissions-updated', permissions: session.permissions })
-        log(`[PERMS] Sesja ${peer.sessionCode} uprawnienia zaktualizowane`)
         break
       }
 
-      // ── Zakończenie sesji ────────────────────────────────────────────
       case 'end-session': {
         const code    = peer.sessionCode
         const session = sessions.get(code)
         if (!session) return
-
         const other = peer.role === 'host' ? session.viewer : session.host
         send(other, { type: 'session-ended', reason: peer.role === 'host' ? 'host-ended' : 'viewer-left' })
         sessions.delete(code)
@@ -190,7 +169,6 @@ wss.on('connection', (ws, req) => {
         break
       }
 
-      // ── Ping/Pong keep-alive ─────────────────────────────────────────
       case 'ping':
         send(ws, { type: 'pong' })
         break
@@ -201,7 +179,6 @@ wss.on('connection', (ws, req) => {
     const peer    = peers.get(ws)
     const code    = peer?.sessionCode
     const session = code ? sessions.get(code) : null
-
     if (session) {
       const other = peer.role === 'host' ? session.viewer : session.host
       send(other, { type: 'session-ended', reason: peer.role === 'host' ? 'host-disconnected' : 'viewer-disconnected' })
@@ -213,12 +190,12 @@ wss.on('connection', (ws, req) => {
         log(`[CLOSE] Viewer rozłączył się z sesji ${code}`)
       }
     }
-
     peers.delete(ws)
-    log(`[DISCONNECT] ${ip}`)
   })
 
   ws.on('error', () => {})
 })
 
-log(`NEQU Signaling Server nasłuchuje na porcie ${PORT}`)
+server.listen(PORT, '0.0.0.0', () => {
+  log(`NEQU Signaling Server nasłuchuje na porcie ${PORT}`)
+})
