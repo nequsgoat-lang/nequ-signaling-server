@@ -11,7 +11,7 @@ const WebSocket = require('ws')
 const crypto    = require('crypto')
 
 const PORT     = process.env.PORT || 8765
-const wss      = new WebSocket.Server({ port: PORT })
+const wss      = new WebSocket.Server({ port: PORT, host: '0.0.0.0' })
 
 // Mapa aktywnych sesji: sessionCode -> { host, viewer, permissions, createdAt, hostId }
 const sessions = new Map()
